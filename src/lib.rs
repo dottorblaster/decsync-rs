@@ -49,7 +49,7 @@ mod tests {
     #[test]
     fn decsync_is_constructed() {
         let decsync_instance = DecSyncInstance::new(
-            "directory".to_owned(),
+            "test/directory1".to_owned(),
             "all".to_owned(),
             Some("all".to_owned()),
             "org.gnome.Newsflash".to_owned(),
@@ -57,6 +57,8 @@ mod tests {
         assert_eq!(
             decsync_instance.own_app_id,
             "org.gnome.Newsflash".to_owned()
-        )
+        );
+
+        let _ = fs::remove_dir_all("test/directory1");
     }
 }
