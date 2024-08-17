@@ -17,6 +17,8 @@ pub fn write_lines(
         writeln!(file, "{}", line)?;
     }
 
+    file.flush()?;
+
     Ok(())
 }
 
