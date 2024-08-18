@@ -105,7 +105,6 @@ mod tests {
         assert_eq!(entry.key, Value::from("some_key"));
     }
 
-
     #[test]
     fn entry_with_path_from_json() {
         let serialized_entry = "[[\"/usr/share\"], \"kekw\", \"some_key\", 2]".to_owned();
