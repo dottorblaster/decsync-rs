@@ -41,6 +41,20 @@ impl DecSyncInstance {
         }
     }
 
+    pub fn set_entry(
+        &self,
+        path: Vec<String>,
+        key: serde_json::Value,
+        value: serde_json::Value,
+    ) -> Result<(), error::DecSyncError> {
+        self.set_entries(vec![entry::EntryWithPath::new(
+            path,
+            time::current_date_time(),
+            key,
+            value,
+        )])
+    }
+
     pub fn set_entries(
         &self,
         entries_with_path: Vec<entry::EntryWithPath>,
