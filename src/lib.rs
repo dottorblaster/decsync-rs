@@ -479,6 +479,60 @@ impl<T> DecSyncInstance<T> {
         self.execute_all_new_entries_internal(None)
     }
 
+    /// Whether any other application has entries this instance has not
+    /// pulled yet.
+    ///
+    /// Compares every other `v2/<app-id>/sequences` file against the
+    /// local read state; nothing is written. Cheap enough to poll.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use decsync::DecSyncInstance;
+    /// # let dir = std::env::temp_dir().join("decsync-docs-pending");
+    /// # let _ = std::fs::remove_dir_all(&dir);
+    /// let mut app = DecSyncInstance::<()>::new(
+    ///     dir.to_string_lossy().into_owned(),
+    ///     "rss".to_owned(),
+    ///     None,
+    ///     "reader".to_owned(),
+    /// )
+    /// .unwrap();
+    ///
+    /// if app.has_new_entries().unwrap() {
+    ///     app.execute_all_new_entries(&()).unwrap();
+    /// }
+    /// # let _ = std::fs::remove_dir_all(&dir);
+    /// ```
+    pub fn has_new_entries(&self) -> Result<bool, error::DecSyncError> {
+        Ok(!self.pending_app_ids()?.is_empty())
+    }
+
+    /// The appIds with un-pulled entries, empty when everything is up
+    /// to date.
+    ///
+    /// This is the signal a watcher or poller should react to: once it
+    /// stops changing after a pull, the read state has caught up.
+    /// [`execute_all_new_entries`](Self::execute_all_new_entries) is
+    /// still the thing that actually merges.
+    pub fn pending_app_ids(&self) -> Result<Vec<String>, error::DecSyncError> {
+        let v2_dir = self.decsync_dir_path.join("v2");
+        let local_sequences_file = self.local_dir().join("sequences");
+        let local_sequences = read_local_sequences(&local_sequences_file)?;
+
+        let mut pending = Vec::new();
+        for app_id in file_utils::list_directories(&v2_dir)? {
+            if app_id == self.own_app_id {
+                continue;
+            }
+            let app_sequences = read_sequences(&v2_dir.join(&app_id).join("sequences"))?;
+            if sequences_have_news(&app_sequences, &app_id, &local_sequences) {
+                pending.push(app_id);
+            }
+        }
+        Ok(pending)
+    }
+
     fn execute_all_new_entries_internal(
         &mut self,
         extra: Option<&T>,
@@ -871,6 +925,21 @@ fn write_local_sequences(
     sequences: &BTreeMap<String, BTreeMap<String, i64>>,
 ) -> Result<(), error::DecSyncError> {
     file_utils::write_lines(path, vec![serde_json::to_string(sequences)?], false)
+}
+
+fn sequences_have_news(
+    app_sequences: &BTreeMap<String, i64>,
+    app_id: &str,
+    local_sequences: &BTreeMap<String, BTreeMap<String, i64>>,
+) -> bool {
+    app_sequences.iter().any(|(hash, sequence)| {
+        let already_read = local_sequences
+            .get(app_id)
+            .and_then(|hashes| hashes.get(hash))
+            .copied()
+            .unwrap_or(0);
+        *sequence != already_read
+    })
 }
 
 fn read_local_info(
@@ -1925,6 +1994,84 @@ mod tests {
         let executed = executed.borrow();
         assert_eq!(executed.len(), 1);
         assert_eq!(executed[0], serde_json::json!("name"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn pending_app_ids_reports_other_apps_with_news() {
+        let dir = test_dir("pending");
+        let app1 = instance(&dir);
+        let mut app2 = instance_with_app(&dir, "app2");
+
+        assert!(!app2.has_new_entries().unwrap());
+        assert!(app2.pending_app_ids().unwrap().is_empty());
+
+        app1.set_entry(
+            vec!["feeds".to_owned(), "subscriptions".to_owned()],
+            serde_json::json!("https://example.com/feed.rss"),
+            serde_json::json!(true),
+        )
+        .unwrap();
+
+        assert!(app2.has_new_entries().unwrap());
+        assert_eq!(app2.pending_app_ids().unwrap(), vec!["app1".to_owned()]);
+
+        app2.execute_all_new_entries(&()).unwrap();
+
+        assert!(!app2.has_new_entries().unwrap());
+        assert!(app2.pending_app_ids().unwrap().is_empty());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn pending_detects_incremental_writes() {
+        let dir = test_dir("pending-incremental");
+        let app1 = instance(&dir);
+        let mut app2 = instance_with_app(&dir, "app2");
+
+        app1.set_entry(
+            vec!["feeds".to_owned(), "subscriptions".to_owned()],
+            serde_json::json!("https://example.com/feed.rss"),
+            serde_json::json!(true),
+        )
+        .unwrap();
+        app2.execute_all_new_entries(&()).unwrap();
+        assert!(app2.pending_app_ids().unwrap().is_empty());
+
+        app1.set_entry(
+            vec!["feeds".to_owned(), "names".to_owned()],
+            serde_json::json!("https://example.com/feed.rss"),
+            serde_json::json!("Example"),
+        )
+        .unwrap();
+
+        assert!(app2.has_new_entries().unwrap());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn pending_ignores_own_activity() {
+        let dir = test_dir("pending-own");
+        let app1 = instance(&dir);
+        let mut app2 = instance_with_app(&dir, "app2");
+
+        app2.set_entry(
+            vec!["feeds".to_owned(), "subscriptions".to_owned()],
+            serde_json::json!("https://example.com/feed.rss"),
+            serde_json::json!(true),
+        )
+        .unwrap();
+
+        assert!(app2.pending_app_ids().unwrap().is_empty());
+
+        app1.set_entry(
+            vec!["feeds".to_owned(), "subscriptions".to_owned()],
+            serde_json::json!("https://example.com/other.rss"),
+            serde_json::json!(true),
+        )
+        .unwrap();
+
+        assert_eq!(app2.pending_app_ids().unwrap(), vec!["app1".to_owned()]);
         let _ = fs::remove_dir_all(dir);
     }
 }
