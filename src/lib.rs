@@ -1,19 +1,135 @@
+#![warn(missing_docs)]
+
+//! Synchronize key-value entries through a shared directory.
+//!
+//! DecSync is a file layout and a set of merge rules that turn a
+//! plain directory into a conflict-free key-value store shared by
+//! several devices. An entry is a path (list of strings), a key, a
+//! value and a write timestamp. When two devices write the same
+//! path/key, the newest timestamp wins; everything else converges by
+//! replaying what could not be applied yet. The directory is mirrored
+//! between devices by whatever file sync tool you already run
+//! (Syncthing, Dropbox, cron'd rsync).
+//!
+//! This crate implements the **v2** file format. v1 directories are
+//! not understood: a version other than v2 in `.decsync-info` fails
+//! with [`error::DecSyncError::UnsupportedVersion`].
+//!
+//! # Layout
+//!
+//! ```text
+//! DECSYNC_DIR/
+//! ├── .decsync-info              format version marker
+//! └── <sync-type>/               e.g. "rss", "contacts"
+//!     └── <collection-id>/       when a sync type has several collections
+//!         ├── v2/<app-id>/       your entries, one JSON document per line
+//!         │   ├── 00 .. ff       paths hashed into these 256 buckets
+//!         │   ├── info           entries with the path ["info"]
+//!         │   └── sequences      how often each bucket changed
+//!         └── local/<app-id>/    bookkeeping for this device only
+//!             ├── info           version and last active date
+//!             └── sequences      what was already read from the others
+//! ```
+//!
+//! Each application only writes inside its own `v2/<app-id>`
+//! directory, so devices never compete for a file. New entries are
+//! discovered by comparing `sequences`; pull them with
+//! [`execute_all_new_entries`](DecSyncInstance::execute_all_new_entries).
+//!
+//! # The appId
+//!
+//! [`own_app_id`](DecSyncInstance::own_app_id) must be unique per
+//! device and stable across restarts. Two instances running at the
+//! same time with the same appId will fight over a directory;
+//! reinstalling an app may reuse its old id.
+//!
+//! # Example
+//!
+//! ```
+//! # use decsync::DecSyncInstance;
+//! // One directory, mirrored to a second machine by file sync.
+//! let dir = std::env::temp_dir().join("decsync-docs-root");
+//! let _ = std::fs::remove_dir_all(&dir);
+//!
+//! let mut phone = DecSyncInstance::<u32>::new(
+//!     dir.to_string_lossy().into_owned(),
+//!     "rss".to_owned(),
+//!     None,
+//!     "phone".to_owned(),
+//! )
+//! .unwrap();
+//! let mut laptop = DecSyncInstance::<u32>::new(
+//!     dir.to_string_lossy().into_owned(),
+//!     "rss".to_owned(),
+//!     None,
+//!     "laptop".to_owned(),
+//! )
+//! .unwrap();
+//!
+//! phone
+//!     .set_entry(
+//!         vec!["feeds".to_owned(), "subscriptions".to_owned()],
+//!         serde_json::json!("https://example.com/feed.rss"),
+//!         serde_json::json!(true),
+//!     )
+//!     .unwrap();
+//!
+//! let seen = std::rc::Rc::new(std::cell::RefCell::new(None));
+//! let on_laptop = seen.clone();
+//! laptop.add_listener(vec![], move |path, entry, _| {
+//!     *on_laptop.borrow_mut() = Some((path, entry.value));
+//! });
+//!
+//! laptop.execute_all_new_entries(&7).unwrap();
+//!
+//! let seen = seen.borrow();
+//! let (path, value) = seen.as_ref().unwrap();
+//! assert_eq!(*path, vec!["feeds".to_owned(), "subscriptions".to_owned()]);
+//! assert_eq!(*value, serde_json::json!(true));
+//!
+//! let _ = std::fs::remove_dir_all(&dir);
+//! ```
+//!
+//! # Limitations
+//!
+//! - v1 directories are rejected up front.
+//! - Nothing watches the directory; entries arrive when
+//!   [`execute_all_new_entries`](DecSyncInstance::execute_all_new_entries)
+//!   is called.
+//! - A [`DecSyncInstance`] is neither [`Send`] nor [`Sync`]: listeners
+//!   are closures and dispatch mutates them. Use it from one thread.
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 
-mod entry;
-mod error;
+pub mod entry;
+pub mod error;
 mod file_utils;
 mod hash;
 mod time;
 
 const CURRENT_VERSION: i64 = 2;
 
+/// One application's handle on a DecSync directory.
+///
+/// `T` is the type of the `extra` value handed to listeners when an
+/// entry is executed. The extra is chosen where the execution happens,
+/// so one listener can see different extras across calls.
+///
+/// An instance is neither [`Send`] nor [`Sync`] (listeners are kept as
+/// closures and mutated during dispatch). Keep instance and directory
+/// on one thread at a time; the file format itself tolerates
+/// concurrent processes because they write disjoint files.
 pub struct DecSyncInstance<T> {
+    /// Directory holding the synchronized files, as given to [`new`](Self::new).
     pub decsync_dir: String,
+    /// Kind of data being synced, e.g. `"rss"` or `"calendars"`.
     pub sync_type: String,
+    /// Collection inside `sync_type`, when there is more than one.
     pub collection: Option<String>,
+    /// Identifier of this application; its `v2/<app-id>` directory is
+    /// the only part of the store it may write.
     pub own_app_id: String,
     decsync_dir_path: PathBuf,
     listeners: Vec<Listener<T>>,
@@ -32,6 +148,13 @@ struct UpdateOutcome {
 }
 
 impl<T> DecSyncInstance<T> {
+    /// Opens the DecSync directory for `sync_type`/`collection` and
+    /// sets up this application's `v2` and `local` directories.
+    ///
+    /// Creating the directory also writes `.decsync-info` when missing,
+    /// so a fresh path works without any setup. A version other than
+    /// v2, or garbage in the marker, is an error: the handle refuses
+    /// to read formats it does not implement instead of guessing.
     pub fn new(
         decsync_dir: String,
         sync_type: String,
@@ -76,6 +199,58 @@ impl<T> DecSyncInstance<T> {
         self.decsync_dir_path.join("local").join(&self.own_app_id)
     }
 
+    /// Registers a listener for entries whose path starts with `subpath`.
+    ///
+    /// The callback gets the entry with `subpath` removed from its
+    /// path, plus the `extra` handed to the executing call. Only the
+    /// first matching listener (registration order) runs for a path,
+    /// and the internal `last-active-*` / `supported-version-*`
+    /// bookkeeping under `["info"]` is filtered out before dispatch.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use decsync::DecSyncInstance;
+    /// # let dir = std::env::temp_dir().join("decsync-docs-listener");
+    /// # let _ = std::fs::remove_dir_all(&dir);
+    /// let mut decsync = DecSyncInstance::<()>::new(
+    ///     dir.to_string_lossy().into_owned(),
+    ///     "rss".to_owned(),
+    ///     None,
+    ///     "reader".to_owned(),
+    /// )
+    /// .unwrap();
+    ///
+    /// let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    /// let to_reader = seen.clone();
+    /// decsync.add_listener(vec!["feeds".to_owned()], move |path, entry, _| {
+    ///     to_reader.borrow_mut().push((path, entry.key));
+    /// });
+    ///
+    /// decsync
+    ///     .set_entry(
+    ///         vec!["feeds".to_owned(), "subscriptions".to_owned()],
+    ///         serde_json::json!("https://example.com/feed.rss"),
+    ///         serde_json::json!(true),
+    ///     )
+    ///     .unwrap();
+    ///
+    /// // Own writes never dispatch; replay the stored entry instead.
+    /// // The listener sees the path minus its registered subpath.
+    /// decsync
+    ///     .execute_stored_entries_for_path_exact(
+    ///         vec!["feeds".to_owned(), "subscriptions".to_owned()],
+    ///         &(),
+    ///         None,
+    ///     )
+    ///     .unwrap();
+    ///
+    /// let seen = seen.borrow();
+    /// assert_eq!(seen.len(), 1);
+    /// assert_eq!(seen[0].0, vec!["subscriptions".to_owned()]);
+    /// assert_eq!(seen[0].1, serde_json::json!("https://example.com/feed.rss"));
+    /// # let _ = std::fs::remove_dir_all(&dir);
+    /// ```
     pub fn add_listener<F>(&mut self, subpath: Vec<String>, on_entry_update: F)
     where
         F: FnMut(Vec<String>, entry::Entry, &T) + 'static,
@@ -96,6 +271,13 @@ impl<T> DecSyncInstance<T> {
         self.listeners.push(Listener { subpath, callback });
     }
 
+    /// Like [`add_listener`](Self::add_listener), with a chance to refuse.
+    ///
+    /// Returning `false` drops the entry: it is neither saved locally
+    /// nor acknowledged in the read state, and the next
+    /// [`execute_all_new_entries`](Self::execute_all_new_entries) tries
+    /// again. This is how a name for a not-yet-known feed waits for the
+    /// feed to appear, then fires.
     pub fn add_listener_with_success<F>(&mut self, subpath: Vec<String>, on_entry_update: F)
     where
         F: FnMut(Vec<String>, entry::Entry, &T) -> bool + 'static,
@@ -120,6 +302,11 @@ impl<T> DecSyncInstance<T> {
         self.listeners.push(Listener { subpath, callback });
     }
 
+    /// One callback per path instead of one per entry.
+    ///
+    /// The whole batch of entries for the matched path is delivered as
+    /// a slice. Use this when the action is per-path rather than
+    /// per-entry.
     pub fn add_multi_listener<F>(&mut self, subpath: Vec<String>, on_entries_update: F)
     where
         F: FnMut(Vec<String>, &[entry::Entry], &T) + 'static,
@@ -134,6 +321,8 @@ impl<T> DecSyncInstance<T> {
         self.listeners.push(Listener { subpath, callback });
     }
 
+    /// Like [`add_multi_listener`](Self::add_multi_listener); a `false`
+    /// return rejects the entire batch.
     pub fn add_multi_listener_with_success<F>(&mut self, subpath: Vec<String>, on_entries_update: F)
     where
         F: FnMut(Vec<String>, &[entry::Entry], &T) -> bool + 'static,
@@ -151,6 +340,34 @@ impl<T> DecSyncInstance<T> {
         self.listeners.push(Listener { subpath, callback });
     }
 
+    /// Sets a single entry and stamps it with the current time.
+    ///
+    /// The entry lands in this application's bucket for the hashed
+    /// path and its sequence number goes up by one.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use decsync::DecSyncInstance;
+    /// # let dir = std::env::temp_dir().join("decsync-docs-set-entry");
+    /// # let _ = std::fs::remove_dir_all(&dir);
+    /// let decsync = DecSyncInstance::<()>::new(
+    ///     dir.to_string_lossy().into_owned(),
+    ///     "rss".to_owned(),
+    ///     None,
+    ///     "reader".to_owned(),
+    /// )
+    /// .unwrap();
+    ///
+    /// decsync
+    ///     .set_entry(
+    ///         vec!["feeds".to_owned(), "subscriptions".to_owned()],
+    ///         serde_json::json!("https://example.com/feed.rss"),
+    ///         serde_json::json!(true),
+    ///     )
+    ///     .unwrap();
+    /// # let _ = std::fs::remove_dir_all(&dir);
+    /// ```
     pub fn set_entry(
         &self,
         path: Vec<String>,
@@ -165,6 +382,16 @@ impl<T> DecSyncInstance<T> {
         )])
     }
 
+    /// Sets several entries in one call.
+    ///
+    /// Entries sharing a path hash share one bucket file and one
+    /// sequence bump, so batching beats a loop of
+    /// [`set_entry`](Self::set_entry) whenever paths repeat.
+    ///
+    /// Entries older than what is already stored for the same path and
+    /// key are dropped, and re-writing an identical value changes
+    /// nothing. The format makes replays idempotent: feeding an old
+    /// dataset in here will not clobber newer data.
     pub fn set_entries(
         &self,
         entries_with_path: Vec<entry::EntryWithPath>,
@@ -187,10 +414,67 @@ impl<T> DecSyncInstance<T> {
         write_sequences(&sequences_file, &sequences)
     }
 
+    /// Pulls in everything the other applications wrote since the last
+    /// pull, merging it into this application's own files.
+    ///
+    /// Buckets whose sequence number moved are read whole and merged;
+    /// already-up-to-date entries fall out of the merge by their
+    /// timestamps. The own `sequences` file stays untouched — other
+    /// apps pick the originals up themselves — while the local read
+    /// state is advanced so the next pull skips those buckets.
+    ///
+    /// Entries rejected by a listener are not merged here; they are
+    /// retried on the next call. [`init_stored_entries`](Self::init_stored_entries)
+    /// does the same pull without dispatching listeners.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use decsync::DecSyncInstance;
+    /// # let dir = std::env::temp_dir().join("decsync-docs-pull");
+    /// # let _ = std::fs::remove_dir_all(&dir);
+    /// let a = DecSyncInstance::<()>::new(
+    ///     dir.to_string_lossy().into_owned(),
+    ///     "rss".to_owned(),
+    ///     None,
+    ///     "device-a".to_owned(),
+    /// )
+    /// .unwrap();
+    /// let mut b = DecSyncInstance::<()>::new(
+    ///     dir.to_string_lossy().into_owned(),
+    ///     "rss".to_owned(),
+    ///     None,
+    ///     "device-b".to_owned(),
+    /// )
+    /// .unwrap();
+    ///
+    /// a.set_entry(
+    ///     vec!["feeds".to_owned(), "subscriptions".to_owned()],
+    ///     serde_json::json!("https://example.com/feed.rss"),
+    ///     serde_json::json!(true),
+    /// )
+    /// .unwrap();
+    ///
+    /// b.execute_all_new_entries(&()).unwrap();
+    ///
+    /// // The entry now sits in b's own files, ready to be executed.
+    /// // `b9` is the bucket for ["feeds", "subscriptions"].
+    /// let content = std::fs::read_to_string(
+    ///     dir.join("rss").join("v2").join("device-b").join("b9"),
+    /// )
+    /// .unwrap();
+    /// assert!(content.contains("https://example.com/feed.rss"));
+    /// # let _ = std::fs::remove_dir_all(&dir);
+    /// ```
     pub fn execute_all_new_entries(&mut self, extra: &T) -> Result<(), error::DecSyncError> {
         self.execute_all_new_entries_internal(Some(extra))
     }
 
+    /// The same pull as [`execute_all_new_entries`](Self::execute_all_new_entries),
+    /// without running any listener.
+    ///
+    /// The usual first thing an app does after (re)install: get the
+    /// stored entries local, then replay what matters with `execute_stored_*`.
     pub fn init_stored_entries(&mut self) -> Result<(), error::DecSyncError> {
         self.execute_all_new_entries_internal(None)
     }
@@ -278,6 +562,13 @@ impl<T> DecSyncInstance<T> {
         Ok(())
     }
 
+    /// Replays one already-stored entry through its listener.
+    ///
+    /// Reads the current value from this application's own files and
+    /// dispatches it; nothing is written. Use this for things that
+    /// could not be applied when they arrived, once their
+    /// prerequisites exist. Returns whether every listener accepted
+    /// the entry.
     pub fn execute_stored_entry(
         &mut self,
         path: Vec<String>,
@@ -287,6 +578,10 @@ impl<T> DecSyncInstance<T> {
         self.execute_stored_entries_for_path_exact(path, extra, Some(std::slice::from_ref(&key)))
     }
 
+    /// Several replays at once, grouped by path so one bucket read
+    /// serves an entire path.
+    ///
+    /// Same semantics as [`execute_stored_entry`](Self::execute_stored_entry).
     pub fn execute_stored_entries(
         &mut self,
         stored_entries: Vec<entry::StoredEntry>,
@@ -307,6 +602,10 @@ impl<T> DecSyncInstance<T> {
         Ok(all_success)
     }
 
+    /// Replays stored entries with exactly `path`, optionally
+    /// restricted to some `keys`.
+    ///
+    /// `None` for `keys` means whatever keys are stored.
     pub fn execute_stored_entries_for_path_exact(
         &mut self,
         path: Vec<String>,
@@ -323,6 +622,53 @@ impl<T> DecSyncInstance<T> {
         Ok(execute_entries(&mut self.listeners, &mut entries, extra))
     }
 
+    /// Replays stored entries whose path starts with `prefix`,
+    /// optionally restricted to some `keys`.
+    ///
+    /// Unlike the exact form, this scans all 256 buckets plus the
+    /// `info` file, so it is the slow way to reach deeply nested
+    /// entries. Keep it for initial loads and retries.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use decsync::DecSyncInstance;
+    /// # let dir = std::env::temp_dir().join("decsync-docs-replay");
+    /// # let _ = std::fs::remove_dir_all(&dir);
+    /// let mut decsync = DecSyncInstance::<()>::new(
+    ///     dir.to_string_lossy().into_owned(),
+    ///     "rss".to_owned(),
+    ///     None,
+    ///     "reader".to_owned(),
+    /// )
+    /// .unwrap();
+    ///
+    /// // A feed name arrives while the feed is not subscribed yet; it
+    /// // is stored and replayed once the subscription shows up.
+    /// decsync
+    ///     .set_entries(vec![decsync::entry::EntryWithPath::new(
+    ///         vec!["feeds".to_owned(), "names".to_owned()],
+    ///         "2020-07-17T12:00:00".to_owned(),
+    ///         serde_json::json!("https://example.com/feed.rss"),
+    ///         serde_json::json!("Example feed"),
+    ///     )])
+    ///     .unwrap();
+    ///
+    /// let replayed = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    /// let to_replayed = replayed.clone();
+    /// decsync.add_listener(vec![], move |_, entry, _| {
+    ///     to_replayed.borrow_mut().push(entry.value.clone());
+    /// });
+    ///
+    /// decsync
+    ///     .execute_stored_entries_for_path_prefix(vec!["feeds".to_owned()], &(), None)
+    ///     .unwrap();
+    ///
+    /// let replayed = replayed.borrow();
+    /// assert_eq!(replayed.len(), 1);
+    /// assert_eq!(replayed[0], serde_json::json!("Example feed"));
+    /// # let _ = std::fs::remove_dir_all(&dir);
+    /// ```
     pub fn execute_stored_entries_for_path_prefix(
         &mut self,
         prefix: Vec<String>,
@@ -556,6 +902,28 @@ fn get_decsync_subdir(decsync_dir: &str, sync_type: &str, collection: Option<&st
     decsync_path
 }
 
+/// Checks `.decsync-info` in `decsync_dir`, creating it with the
+/// current version when it does not exist.
+///
+/// Malformed content becomes [`InvalidInfo`]; a version this crate
+/// does not implement becomes [`UnsupportedVersion`].
+///
+/// # Example
+///
+/// ```
+/// use decsync::check_decsync_info;
+/// let dir = std::env::temp_dir().join("decsync-docs-info");
+/// let _ = std::fs::remove_dir_all(&dir);
+///
+/// check_decsync_info(&dir.to_string_lossy()).unwrap();
+///
+/// let marker = std::fs::read_to_string(dir.join(".decsync-info")).unwrap();
+/// assert_eq!(marker.trim(), r#"{"version":2}"#);
+/// # let _ = std::fs::remove_dir_all(&dir);
+/// ```
+///
+/// [`InvalidInfo`]: crate::error::DecSyncError::InvalidInfo
+/// [`UnsupportedVersion`]: crate::error::DecSyncError::UnsupportedVersion
 pub fn check_decsync_info(decsync_dir: &str) -> Result<(), error::DecSyncError> {
     let info_file = PathBuf::from(decsync_dir).join(".decsync-info");
     let info = read_decsync_info_or_default(&info_file)?;
@@ -589,6 +957,11 @@ fn check_version(info: &BTreeMap<String, serde_json::Value>) -> Result<(), error
     }
 }
 
+/// Names the collections under `decsync_dir/<sync-type>`.
+///
+/// Nothing is created along the way. Empty for sync types without
+/// collections, so this only means something for multi-collection
+/// sync types.
 pub fn list_decsync_collections(
     decsync_dir: &str,
     sync_type: &str,
@@ -596,6 +969,45 @@ pub fn list_decsync_collections(
     file_utils::list_directories(&get_decsync_subdir(decsync_dir, sync_type, None))
 }
 
+/// The newest stored entries under `["info"]`, merged across all
+/// applications.
+///
+/// These are the collection facts needed before opening a handle:
+/// `"name"`, `"color"`, `"deleted"`, plus the `last-active-<appId>`
+/// dates written during maintenance. Absent keys are simply
+/// missing from the map.
+///
+/// # Example
+///
+/// ```
+/// # use decsync::{DecSyncInstance, get_static_info};
+/// # let dir = std::env::temp_dir().join("decsync-docs-static");
+/// # let _ = std::fs::remove_dir_all(&dir);
+/// let decsync = DecSyncInstance::<()>::new(
+///     dir.to_string_lossy().into_owned(),
+///     "calendars".to_owned(),
+///     Some("col1".to_owned()),
+///     "app".to_owned(),
+/// )
+/// .unwrap();
+///
+/// decsync
+///     .set_entries(vec![decsync::entry::EntryWithPath::new(
+///         vec!["info".to_owned()],
+///         "2020-07-17T12:30:00".to_owned(),
+///         serde_json::json!("name"),
+///         serde_json::json!("Holidays"),
+///     )])
+///     .unwrap();
+///
+/// let info = get_static_info(dir.to_string_lossy().as_ref(), "calendars", Some("col1"))
+///     .unwrap();
+/// assert_eq!(
+///     info.get(&serde_json::json!("name")),
+///     Some(&serde_json::json!("Holidays"))
+/// );
+/// # let _ = std::fs::remove_dir_all(&dir);
+/// ```
 pub fn get_static_info(
     decsync_dir: &str,
     sync_type: &str,
