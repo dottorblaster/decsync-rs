@@ -1,6 +1,6 @@
 [package]
 name = "decsync"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Conflict-free key-value entries synchronized through a shared directory"
 repository = "https://github.com/dottorblaster/decsync-rs"
