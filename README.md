@@ -1,5 +1,8 @@
 # decsync
 
+[![docs.rs](https://docs.rs/decsync/badge.svg)](https://docs.rs/decsync)
+[![CI](https://img.shields.io/github/actions/workflow/status/dottorblaster/decsync-rs/rust.yml?label=CI)](https://github.com/dottorblaster/decsync-rs/actions/workflows/rust.yml)
+
 Rust implementation of [DecSync](https://github.com/39aldo39/DecSync):
 a set of key-value entries kept in sync between devices using nothing
 but a shared directory. The directory is mirrored by whatever file
