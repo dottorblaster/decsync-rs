@@ -73,6 +73,17 @@ pub struct GroupedEntries {
     pub entries: Vec<EntryWithPath>,
 }
 
+pub struct StoredEntry {
+    pub path: Vec<String>,
+    pub key: Value,
+}
+
+impl StoredEntry {
+    pub fn new(path: Vec<String>, key: Value) -> StoredEntry {
+        StoredEntry { path, key }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

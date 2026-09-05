@@ -22,6 +22,14 @@ fn poly_hash(p: i32, xs: Vec<i32>) -> i32 {
     xs.into_iter().fold(0, |hash, x| (hash * p + x) % HASH_BINS)
 }
 
+pub fn all_hashes() -> Vec<String> {
+    let mut hashes = (0..HASH_BINS)
+        .map(|hash| format!("{:0>2x}", hash))
+        .collect::<Vec<_>>();
+    hashes.push("info".to_owned());
+    hashes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -63,5 +71,14 @@ mod tests {
     fn only_exact_info_path_is_exempt() {
         let path = vec!["feeds".to_owned(), "info".to_owned()];
         assert_ne!(path_to_hash(path), "info".to_owned());
+    }
+
+    #[test]
+    fn all_hashes_includes_info_last() {
+        let hashes = all_hashes();
+        assert_eq!(hashes.len(), 257);
+        assert_eq!(hashes[0], "00");
+        assert_eq!(hashes[255], "ff");
+        assert_eq!(hashes[256], "info");
     }
 }
