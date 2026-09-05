@@ -7,10 +7,15 @@ pub fn write_lines(
     lines: Vec<String>,
     append: bool,
 ) -> Result<(), crate::error::DecSyncError> {
-    let file = fs::OpenOptions::new()
-        .create(true)
-        .append(append)
-        .open(&path)?;
+    let mut options = fs::OpenOptions::new();
+    options.create(true);
+    if append {
+        options.append(true);
+    } else {
+        options.write(true).truncate(true);
+    }
+
+    let file = options.open(path)?;
     let mut file = BufWriter::new(file);
 
     for line in lines {
@@ -22,6 +27,8 @@ pub fn write_lines(
     Ok(())
 }
 
-pub fn read_lines(path: PathBuf) -> Result<Vec<String>, crate::error::DecSyncError> {
-    todo!()
+pub fn read_lines(path: &PathBuf) -> Result<Vec<String>, crate::error::DecSyncError> {
+    Ok(fs::read_to_string(path)
+        .map(|text| text.lines().map(String::from).collect())
+        .unwrap_or_default())
 }
