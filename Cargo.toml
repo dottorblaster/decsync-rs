@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Conflict-free key-value entries synchronized through a shared directory"
 repository = "https://github.com/dottorblaster/decsync-rs"
+license = "Apache-2.0"
 keywords = ["decsync", "synchronization", "key-value", "syncthing", "p2p"]
 categories = ["database"]
 
