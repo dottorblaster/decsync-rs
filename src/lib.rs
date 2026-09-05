@@ -93,7 +93,8 @@
 //! # Limitations
 //!
 //! - v1 directories are rejected up front.
-//! - Nothing watches the directory; entries arrive when
+//! - No event-driven watching. The [`Notifier`] polls for changes;
+//!   entries arrive when
 //!   [`execute_all_new_entries`](DecSyncInstance::execute_all_new_entries)
 //!   is called.
 //! - A [`DecSyncInstance`] is neither [`Send`] nor [`Sync`]: listeners
@@ -101,13 +102,16 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub mod entry;
 pub mod error;
 mod file_utils;
 mod hash;
+mod notifier;
 mod time;
+
+pub use notifier::Notifier;
 
 const CURRENT_VERSION: i64 = 2;
 
@@ -516,21 +520,7 @@ impl<T> DecSyncInstance<T> {
     /// [`execute_all_new_entries`](Self::execute_all_new_entries) is
     /// still the thing that actually merges.
     pub fn pending_app_ids(&self) -> Result<Vec<String>, error::DecSyncError> {
-        let v2_dir = self.decsync_dir_path.join("v2");
-        let local_sequences_file = self.local_dir().join("sequences");
-        let local_sequences = read_local_sequences(&local_sequences_file)?;
-
-        let mut pending = Vec::new();
-        for app_id in file_utils::list_directories(&v2_dir)? {
-            if app_id == self.own_app_id {
-                continue;
-            }
-            let app_sequences = read_sequences(&v2_dir.join(&app_id).join("sequences"))?;
-            if sequences_have_news(&app_sequences, &app_id, &local_sequences) {
-                pending.push(app_id);
-            }
-        }
-        Ok(pending)
+        compute_pending_app_ids(&self.decsync_dir_path, &self.own_app_id)
     }
 
     fn execute_all_new_entries_internal(
@@ -940,6 +930,31 @@ fn sequences_have_news(
             .unwrap_or(0);
         *sequence != already_read
     })
+}
+
+fn compute_pending_app_ids(
+    decsync_dir_path: &Path,
+    own_app_id: &str,
+) -> Result<Vec<String>, error::DecSyncError> {
+    let v2_dir = decsync_dir_path.join("v2");
+    let local_sequences = read_local_sequences(
+        &decsync_dir_path
+            .join("local")
+            .join(own_app_id)
+            .join("sequences"),
+    )?;
+
+    let mut pending = Vec::new();
+    for app_id in file_utils::list_directories(&v2_dir)? {
+        if app_id == own_app_id {
+            continue;
+        }
+        let app_sequences = read_sequences(&v2_dir.join(&app_id).join("sequences"))?;
+        if sequences_have_news(&app_sequences, &app_id, &local_sequences) {
+            pending.push(app_id);
+        }
+    }
+    Ok(pending)
 }
 
 fn read_local_info(
@@ -2072,6 +2087,67 @@ mod tests {
         .unwrap();
 
         assert_eq!(app2.pending_app_ids().unwrap(), vec!["app1".to_owned()]);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn notifier_matches_instance_pending() {
+        let dir = test_dir("notifier-pending");
+        let app1 = instance(&dir);
+        let app2 = instance_with_app(&dir, "app2");
+
+        app1.set_entry(
+            vec!["feeds".to_owned(), "subscriptions".to_owned()],
+            serde_json::json!("https://example.com/feed.rss"),
+            serde_json::json!(true),
+        )
+        .unwrap();
+
+        let notifier = Notifier::new(&dir.to_string_lossy(), "rss", None, "app2");
+        assert_eq!(
+            notifier.pending_app_ids().unwrap(),
+            app2.pending_app_ids().unwrap()
+        );
+        assert_eq!(notifier.pending_app_ids().unwrap(), vec!["app1".to_owned()]);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn notifier_watch_delivers_pending_and_goes_quiet() {
+        let dir = test_dir("notifier-watch");
+        let app1 = instance(&dir);
+        let mut app2 = instance_with_app(&dir, "app2");
+        let interval = std::time::Duration::from_millis(10);
+
+        app1.set_entry(
+            vec!["feeds".to_owned(), "subscriptions".to_owned()],
+            serde_json::json!("https://example.com/feed.rss"),
+            serde_json::json!(true),
+        )
+        .unwrap();
+
+        let (watcher, news) =
+            Notifier::new(&dir.to_string_lossy(), "rss", None, "app2").watch(interval);
+
+        let pending = news
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(pending, vec!["app1".to_owned()]);
+
+        app2.execute_all_new_entries(&()).unwrap();
+        std::thread::sleep(interval * 5);
+
+        let mut dropped = Vec::new();
+        loop {
+            match news.try_recv() {
+                Ok(pending) => dropped.push(pending),
+                _ => break,
+            }
+        }
+        assert!(dropped.is_empty());
+
+        drop(news);
+        watcher.join();
         let _ = fs::remove_dir_all(dir);
     }
 }

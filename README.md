@@ -45,8 +45,8 @@ exists, say) are stored anyway and replayed later with
 ## Limits
 
 - No v1 support.
-- No file watching: entries arrive when `execute_all_new_entries()`
-  is called, not when the directory changes.
+- No event-driven watching: a `Notifier` polls for changes, and
+  entries arrive when `execute_all_new_entries()` is called.
 - An instance is not safe to share across threads; keep one per
   thread or process.
 
