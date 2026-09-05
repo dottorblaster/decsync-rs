@@ -44,6 +44,10 @@ impl DecSyncInstance {
         self.own_v2_dir().join("sequences")
     }
 
+    fn local_dir(&self) -> PathBuf {
+        self.decsync_dir_path.join("local").join(&self.own_app_id)
+    }
+
     pub fn set_entry(
         &self,
         path: Vec<String>,
@@ -79,6 +83,53 @@ impl DecSyncInstance {
 
         write_sequences(&sequences_file, &sequences)
     }
+
+    pub fn execute_all_new_entries(&self) -> Result<(), error::DecSyncError> {
+        let v2_dir = self.decsync_dir_path.join("v2");
+        let local_sequences_file = self.local_dir().join("sequences");
+        let mut local_sequences = read_local_sequences(&local_sequences_file)?;
+
+        let mut updated = false;
+        for app_id in file_utils::list_directories(&v2_dir)? {
+            if app_id == self.own_app_id {
+                continue;
+            }
+
+            let app_dir = v2_dir.join(&app_id);
+            let app_sequences = read_sequences(&app_dir.join("sequences"))?;
+            for (hash, sequence) in app_sequences {
+                let already_read = local_sequences
+                    .get(&app_id)
+                    .and_then(|hashes| hashes.get(&hash))
+                    .copied()
+                    .unwrap_or(0);
+                if already_read == sequence {
+                    continue;
+                }
+
+                let app_file = app_dir.join(&hash);
+                if !app_file.is_file() {
+                    continue;
+                }
+
+                let own_file = self.own_v2_dir().join(&hash);
+                let entries = read_entries(&app_file);
+                update_entries(&own_file, entries.into_values().collect(), false)?;
+
+                local_sequences
+                    .entry(app_id.clone())
+                    .or_default()
+                    .insert(hash, sequence);
+                updated = true;
+            }
+        }
+
+        if updated {
+            write_local_sequences(&local_sequences_file, &local_sequences)?;
+        }
+
+        Ok(())
+    }
 }
 
 fn group_by_hash(entries_with_path: Vec<entry::EntryWithPath>) -> Vec<entry::GroupedEntries> {
@@ -98,7 +149,7 @@ fn update_entries(
     entries_with_path: Vec<entry::EntryWithPath>,
     require_new_value: bool,
 ) -> Result<Vec<entry::EntryWithPath>, error::DecSyncError> {
-    let stored_entries = read_stored_entries(file);
+    let stored_entries = read_entries(file);
 
     let new_entries = entries_with_path
         .into_iter()
@@ -143,9 +194,7 @@ fn update_entries(
     Ok(new_entries)
 }
 
-fn read_stored_entries(
-    file: &PathBuf,
-) -> HashMap<(Vec<String>, serde_json::Value), entry::EntryWithPath> {
+fn read_entries(file: &PathBuf) -> HashMap<(Vec<String>, serde_json::Value), entry::EntryWithPath> {
     file_utils::read_lines(file)
         .unwrap_or_default()
         .into_iter()
@@ -176,6 +225,22 @@ fn write_sequences(
     file_utils::write_lines(path, vec![serde_json::to_string(sequences)?], false)
 }
 
+fn read_local_sequences(
+    path: &PathBuf,
+) -> Result<BTreeMap<String, BTreeMap<String, i64>>, error::DecSyncError> {
+    Ok(fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default())
+}
+
+fn write_local_sequences(
+    path: &PathBuf,
+    sequences: &BTreeMap<String, BTreeMap<String, i64>>,
+) -> Result<(), error::DecSyncError> {
+    file_utils::write_lines(path, vec![serde_json::to_string(sequences)?], false)
+}
+
 fn get_decsync_subdir(decsync_dir: &str, sync_type: &str, collection: &Option<String>) -> PathBuf {
     let mut decsync_path = PathBuf::new();
 
@@ -200,12 +265,24 @@ mod tests {
     }
 
     fn instance(dir: &PathBuf) -> DecSyncInstance {
+        instance_with_app(dir, "app1")
+    }
+
+    fn instance_with_app(dir: &PathBuf, app_id: &str) -> DecSyncInstance {
         DecSyncInstance::new(
             dir.to_string_lossy().into_owned(),
             "rss".to_owned(),
             None,
-            "app1".to_owned(),
+            app_id.to_owned(),
         )
+    }
+
+    fn read_local_sequences_json(dir: &PathBuf, app_id: &str) -> serde_json::Value {
+        serde_json::from_str(
+            &fs::read_to_string(dir.join("rss").join("local").join(app_id).join("sequences"))
+                .unwrap(),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -405,6 +482,164 @@ mod tests {
         let sequences: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(decsync.sequences_file()).unwrap()).unwrap();
         assert_eq!(sequences, serde_json::json!({"b8": 1, "b9": 1}));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn execute_all_new_entries_without_other_apps_is_noop() {
+        let dir = test_dir("noop");
+        let app1 = instance(&dir);
+
+        app1.execute_all_new_entries().unwrap();
+
+        assert!(!app1.local_dir().join("sequences").exists());
+        assert!(!app1.own_v2_dir().join("sequences").exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn execute_all_new_entries_merges_other_apps_entries() {
+        let dir = test_dir("pull");
+        let app1 = instance_with_app(&dir, "app1");
+        let app2 = instance_with_app(&dir, "app2");
+
+        app1.set_entry(
+            vec!["feeds".to_owned(), "subscriptions".to_owned()],
+            serde_json::json!("https://foo.example.com/rss"),
+            serde_json::json!(true),
+        )
+        .unwrap();
+
+        app2.execute_all_new_entries().unwrap();
+
+        let content = fs::read_to_string(app2.own_v2_dir().join("b9")).unwrap();
+        let lines = content.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 1);
+        let parsed: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(parsed[0], serde_json::json!(["feeds", "subscriptions"]));
+        assert_eq!(parsed[2], serde_json::json!("https://foo.example.com/rss"));
+        assert_eq!(parsed[3], serde_json::json!(true));
+
+        assert_eq!(
+            read_local_sequences_json(&dir, "app2"),
+            serde_json::json!({"app1": {"b9": 1}})
+        );
+        assert!(!app2.own_v2_dir().join("sequences").exists());
+
+        app2.execute_all_new_entries().unwrap();
+
+        assert_eq!(
+            read_local_sequences_json(&dir, "app2"),
+            serde_json::json!({"app1": {"b9": 1}})
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn newer_entry_wins_across_apps() {
+        let dir = test_dir("converge");
+        let app1 = instance_with_app(&dir, "app1");
+        let app2 = instance_with_app(&dir, "app2");
+        let path = vec!["feeds".to_owned(), "subscriptions".to_owned()];
+
+        app1.set_entries(vec![entry::EntryWithPath::new(
+            path.clone(),
+            "2020-07-17T12:30:00".to_owned(),
+            serde_json::json!("url"),
+            serde_json::json!(true),
+        )])
+        .unwrap();
+        app2.set_entries(vec![entry::EntryWithPath::new(
+            path,
+            "2020-07-17T12:40:00".to_owned(),
+            serde_json::json!("url"),
+            serde_json::json!(false),
+        )])
+        .unwrap();
+
+        app1.execute_all_new_entries().unwrap();
+        app2.execute_all_new_entries().unwrap();
+
+        for instance in [&app1, &app2] {
+            let content = fs::read_to_string(instance.own_v2_dir().join("b9")).unwrap();
+            let lines = content.lines().collect::<Vec<_>>();
+            assert_eq!(lines.len(), 1);
+            let parsed: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+            assert_eq!(parsed[3], serde_json::json!(false));
+        }
+
+        assert_eq!(
+            read_local_sequences_json(&dir, "app1"),
+            serde_json::json!({"app2": {"b9": 1}})
+        );
+        assert_eq!(
+            read_local_sequences_json(&dir, "app2"),
+            serde_json::json!({"app1": {"b9": 1}})
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn local_sequences_gate_which_entries_are_merged() {
+        let dir = test_dir("gating");
+        let app1 = instance_with_app(&dir, "app1");
+        let app2 = instance_with_app(&dir, "app2");
+        let path = vec!["feeds".to_owned(), "subscriptions".to_owned()];
+
+        app1.set_entries(vec![
+            entry::EntryWithPath::new(
+                path.clone(),
+                "2020-07-17T12:30:00".to_owned(),
+                serde_json::json!("a"),
+                serde_json::json!(true),
+            ),
+            entry::EntryWithPath::new(
+                path.clone(),
+                "2020-07-17T12:31:00".to_owned(),
+                serde_json::json!("b"),
+                serde_json::json!(true),
+            ),
+        ])
+        .unwrap();
+
+        app2.execute_all_new_entries().unwrap();
+
+        let content = fs::read_to_string(app2.own_v2_dir().join("b9")).unwrap();
+        assert_eq!(content.lines().count(), 2);
+
+        let remaining = content
+            .lines()
+            .filter(|line| line.contains("\"b\""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(app2.own_v2_dir().join("b9"), remaining).unwrap();
+
+        app2.execute_all_new_entries().unwrap();
+
+        let content = fs::read_to_string(app2.own_v2_dir().join("b9")).unwrap();
+        assert_eq!(content.lines().count(), 1);
+
+        app1.set_entry(path, serde_json::json!("c"), serde_json::json!(true))
+            .unwrap();
+
+        app2.execute_all_new_entries().unwrap();
+
+        let content = fs::read_to_string(app2.own_v2_dir().join("b9")).unwrap();
+        let keys = content
+            .lines()
+            .map(|line| {
+                let parsed: serde_json::Value = serde_json::from_str(line).unwrap();
+                parsed[2].clone()
+            })
+            .collect::<Vec<_>>();
+        assert!(keys.contains(&serde_json::json!("a")));
+        assert!(keys.contains(&serde_json::json!("b")));
+        assert!(keys.contains(&serde_json::json!("c")));
+
+        assert_eq!(
+            read_local_sequences_json(&dir, "app2"),
+            serde_json::json!({"app1": {"b9": 2}})
+        );
         let _ = fs::remove_dir_all(dir);
     }
 }

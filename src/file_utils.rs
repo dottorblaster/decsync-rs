@@ -32,3 +32,17 @@ pub fn read_lines(path: &PathBuf) -> Result<Vec<String>, crate::error::DecSyncEr
         .map(|text| text.lines().map(String::from).collect())
         .unwrap_or_default())
 }
+
+pub fn list_directories(path: &PathBuf) -> Result<Vec<String>, crate::error::DecSyncError> {
+    Ok(fs::read_dir(path)
+        .map(|entries| {
+            let mut names = entries
+                .filter_map(Result::ok)
+                .filter(|entry| entry.path().is_dir())
+                .filter_map(|entry| entry.file_name().into_string().ok())
+                .collect::<Vec<_>>();
+            names.sort();
+            names
+        })
+        .unwrap_or_default())
+}
