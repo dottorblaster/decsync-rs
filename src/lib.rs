@@ -8,6 +8,8 @@ mod file_utils;
 mod hash;
 mod time;
 
+const CURRENT_VERSION: i64 = 2;
+
 pub struct DecSyncInstance<T> {
     pub decsync_dir: String,
     pub sync_type: String,
@@ -35,19 +37,31 @@ impl<T> DecSyncInstance<T> {
         sync_type: String,
         collection: Option<String>,
         own_app_id: String,
-    ) -> DecSyncInstance<T> {
-        let decsync_dir_path = get_decsync_subdir(&decsync_dir, &sync_type, &collection);
+    ) -> Result<DecSyncInstance<T>, error::DecSyncError> {
+        check_decsync_info(&decsync_dir)?;
+
+        let decsync_dir_path = get_decsync_subdir(&decsync_dir, &sync_type, collection.as_deref());
         let _ = fs::create_dir_all(decsync_dir_path.join("v2").join(&own_app_id));
         let _ = fs::create_dir_all(decsync_dir_path.join("local").join(&own_app_id));
 
-        DecSyncInstance {
+        let local_info_file = decsync_dir_path
+            .join("local")
+            .join(&own_app_id)
+            .join("info");
+        let mut local_info = read_local_info(&local_info_file)?;
+        if !local_info.contains_key("version") {
+            local_info.insert("version".to_owned(), serde_json::json!(CURRENT_VERSION));
+            write_local_info(&local_info_file, &local_info)?;
+        }
+
+        Ok(DecSyncInstance {
             decsync_dir,
             sync_type,
             collection,
             own_app_id,
             decsync_dir_path,
             listeners: Vec::new(),
-        }
+        })
     }
 
     fn own_v2_dir(&self) -> PathBuf {
@@ -234,6 +248,31 @@ impl<T> DecSyncInstance<T> {
 
         if updated {
             write_local_sequences(&local_sequences_file, &local_sequences)?;
+        }
+
+        self.maintain()?;
+
+        Ok(())
+    }
+
+    fn maintain(&self) -> Result<(), error::DecSyncError> {
+        let info_file = self.local_dir().join("info");
+        let mut local_info = read_local_info(&info_file)?;
+
+        let current_date = time::current_date();
+        let date_changed = local_info
+            .get("last-active")
+            .and_then(|value| value.as_str())
+            .is_none_or(|last_active| current_date.as_str() > last_active);
+        if date_changed {
+            let date_value = serde_json::json!(current_date);
+            local_info.insert("last-active".to_owned(), date_value.clone());
+            write_local_info(&info_file, &local_info)?;
+            self.set_entry(
+                vec!["info".to_owned()],
+                serde_json::Value::from(format!("last-active-{}", self.own_app_id)),
+                date_value,
+            )?;
         }
 
         Ok(())
@@ -488,7 +527,23 @@ fn write_local_sequences(
     file_utils::write_lines(path, vec![serde_json::to_string(sequences)?], false)
 }
 
-fn get_decsync_subdir(decsync_dir: &str, sync_type: &str, collection: &Option<String>) -> PathBuf {
+fn read_local_info(
+    path: &PathBuf,
+) -> Result<BTreeMap<String, serde_json::Value>, error::DecSyncError> {
+    Ok(fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default())
+}
+
+fn write_local_info(
+    path: &PathBuf,
+    info: &BTreeMap<String, serde_json::Value>,
+) -> Result<(), error::DecSyncError> {
+    file_utils::write_lines(path, vec![serde_json::to_string(info)?], false)
+}
+
+fn get_decsync_subdir(decsync_dir: &str, sync_type: &str, collection: Option<&str>) -> PathBuf {
     let mut decsync_path = PathBuf::new();
 
     decsync_path.push(decsync_dir);
@@ -499,6 +554,77 @@ fn get_decsync_subdir(decsync_dir: &str, sync_type: &str, collection: &Option<St
     }
 
     decsync_path
+}
+
+pub fn check_decsync_info(decsync_dir: &str) -> Result<(), error::DecSyncError> {
+    let info_file = PathBuf::from(decsync_dir).join(".decsync-info");
+    let info = read_decsync_info_or_default(&info_file)?;
+    check_version(&info)
+}
+
+fn read_decsync_info_or_default(
+    path: &PathBuf,
+) -> Result<BTreeMap<String, serde_json::Value>, error::DecSyncError> {
+    match fs::read_to_string(path) {
+        Ok(text) => serde_json::from_str(&text).map_err(|_| error::DecSyncError::InvalidInfo),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let _ = path.parent().map(fs::create_dir_all);
+            let default =
+                BTreeMap::from([("version".to_owned(), serde_json::json!(CURRENT_VERSION))]);
+            write_local_info(path, &default)?;
+            Ok(default)
+        }
+        Err(_) => Err(error::DecSyncError::InvalidInfo),
+    }
+}
+
+fn check_version(info: &BTreeMap<String, serde_json::Value>) -> Result<(), error::DecSyncError> {
+    match info.get("version").and_then(|version| version.as_i64()) {
+        Some(version) if version == CURRENT_VERSION => Ok(()),
+        Some(found) => Err(error::DecSyncError::UnsupportedVersion {
+            supported: CURRENT_VERSION,
+            found,
+        }),
+        None => Err(error::DecSyncError::InvalidInfo),
+    }
+}
+
+pub fn list_decsync_collections(
+    decsync_dir: &str,
+    sync_type: &str,
+) -> Result<Vec<String>, error::DecSyncError> {
+    file_utils::list_directories(&get_decsync_subdir(decsync_dir, sync_type, None))
+}
+
+pub fn get_static_info(
+    decsync_dir: &str,
+    sync_type: &str,
+    collection: Option<&str>,
+) -> Result<HashMap<serde_json::Value, serde_json::Value>, error::DecSyncError> {
+    let dir = get_decsync_subdir(decsync_dir, sync_type, collection).join("v2");
+    let hash = hash::path_to_hash(vec!["info".to_owned()]);
+
+    let mut info: HashMap<serde_json::Value, serde_json::Value> = HashMap::new();
+    let mut datetimes: HashMap<serde_json::Value, String> = HashMap::new();
+
+    for app_id in file_utils::list_directories(&dir)? {
+        for entry in read_entries(&dir.join(&app_id).join(&hash)).into_values() {
+            if entry.path.len() != 1 || entry.path[0] != "info" {
+                continue;
+            }
+            let key = entry.entry.key;
+            let datetime = entry.entry.datetime;
+            if datetimes
+                .get(&key)
+                .is_none_or(|old_datetime| datetime.as_str() > old_datetime.as_str())
+            {
+                info.insert(key.clone(), entry.entry.value);
+                datetimes.insert(key, datetime);
+            }
+        }
+    }
+
+    Ok(info)
 }
 
 #[cfg(test)]
@@ -522,6 +648,7 @@ mod tests {
             None,
             app_id.to_owned(),
         )
+        .unwrap()
     }
 
     fn read_local_sequences_json(dir: &PathBuf, app_id: &str) -> serde_json::Value {
@@ -733,14 +860,22 @@ mod tests {
     }
 
     #[test]
-    fn execute_all_new_entries_without_other_apps_is_noop() {
+    fn execute_all_new_entries_applies_maintenance_without_other_apps() {
         let dir = test_dir("noop");
         let mut app1 = instance(&dir);
 
         app1.execute_all_new_entries(&()).unwrap();
 
         assert!(!app1.local_dir().join("sequences").exists());
-        assert!(!app1.own_v2_dir().join("sequences").exists());
+        assert!(app1.local_dir().join("info").exists());
+
+        let sequences: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(app1.own_v2_dir().join("sequences")).unwrap())
+                .unwrap();
+        assert_eq!(sequences, serde_json::json!({"info": 1}));
+
+        let info_file_content = fs::read_to_string(app1.own_v2_dir().join("info")).unwrap();
+        assert_eq!(info_file_content.lines().count(), 1);
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -771,7 +906,10 @@ mod tests {
             read_local_sequences_json(&dir, "app2"),
             serde_json::json!({"app1": {"b9": 1}})
         );
-        assert!(!app2.own_v2_dir().join("sequences").exists());
+        let own_sequences: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(app2.own_v2_dir().join("sequences")).unwrap())
+                .unwrap();
+        assert_eq!(own_sequences, serde_json::json!({"info": 1}));
 
         app2.execute_all_new_entries(&()).unwrap();
 
@@ -821,8 +959,154 @@ mod tests {
         );
         assert_eq!(
             read_local_sequences_json(&dir, "app2"),
-            serde_json::json!({"app1": {"b9": 1}})
+            serde_json::json!({"app1": {"b9": 1, "info": 1}})
         );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn check_decsync_info_creates_default_and_validates() {
+        let dir = test_dir("check-info");
+        let path = dir.to_string_lossy().into_owned();
+
+        check_decsync_info(&path).unwrap();
+
+        let decsync_info: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(dir.join(".decsync-info")).unwrap()).unwrap();
+        assert_eq!(decsync_info, serde_json::json!({"version": 2}));
+
+        fs::write(dir.join(".decsync-info"), "{\"version\": 3}").unwrap();
+        assert!(matches!(
+            check_decsync_info(&path),
+            Err(error::DecSyncError::UnsupportedVersion { .. })
+        ));
+
+        fs::write(dir.join(".decsync-info"), "not json").unwrap();
+        assert!(matches!(
+            check_decsync_info(&path),
+            Err(error::DecSyncError::InvalidInfo)
+        ));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn constructor_rejects_unsupported_version() {
+        let dir = test_dir("bad-version");
+        let _ = fs::create_dir_all(&dir);
+        fs::write(dir.join(".decsync-info"), "{\"version\": 1}").unwrap();
+
+        let result = DecSyncInstance::<()>::new(
+            dir.to_string_lossy().into_owned(),
+            "rss".to_owned(),
+            None,
+            "app1".to_owned(),
+        );
+        assert!(matches!(
+            result,
+            Err(error::DecSyncError::UnsupportedVersion { .. })
+        ));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn list_decsync_collections_lists_directories() {
+        let dir = test_dir("collections");
+        let path = dir.to_string_lossy().into_owned();
+        DecSyncInstance::<()>::new(
+            path.clone(),
+            "contacts".to_owned(),
+            Some("col1".to_owned()),
+            "app1".to_owned(),
+        )
+        .unwrap();
+        DecSyncInstance::<()>::new(
+            path.clone(),
+            "contacts".to_owned(),
+            Some("col2".to_owned()),
+            "app2".to_owned(),
+        )
+        .unwrap();
+
+        let collections = list_decsync_collections(&path, "contacts").unwrap();
+        assert_eq!(collections, vec!["col1".to_owned(), "col2".to_owned()]);
+
+        assert!(list_decsync_collections(&path, "rss").unwrap().is_empty());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn get_static_info_returns_newest_info_entries() {
+        let dir = test_dir("static-info");
+        let path = dir.to_string_lossy().into_owned();
+        let app1 = DecSyncInstance::<()>::new(
+            path.clone(),
+            "calendars".to_owned(),
+            Some("col1".to_owned()),
+            "app1".to_owned(),
+        )
+        .unwrap();
+        let app2 = DecSyncInstance::<()>::new(
+            path.clone(),
+            "calendars".to_owned(),
+            Some("col1".to_owned()),
+            "app2".to_owned(),
+        )
+        .unwrap();
+
+        app1.set_entries(vec![
+            entry::EntryWithPath::new(
+                vec!["info".to_owned()],
+                "2020-07-17T12:30:00".to_owned(),
+                serde_json::json!("name"),
+                serde_json::json!("Calendar A"),
+            ),
+            entry::EntryWithPath::new(
+                vec!["info".to_owned()],
+                "2020-07-17T12:31:00".to_owned(),
+                serde_json::json!("deleted"),
+                serde_json::json!(false),
+            ),
+        ])
+        .unwrap();
+        app2.set_entries(vec![entry::EntryWithPath::new(
+            vec!["info".to_owned()],
+            "2020-07-17T12:40:00".to_owned(),
+            serde_json::json!("name"),
+            serde_json::json!("Calendar B"),
+        )])
+        .unwrap();
+
+        let info = get_static_info(&path, "calendars", Some("col1")).unwrap();
+        assert_eq!(
+            info.get(&serde_json::json!("name")),
+            Some(&serde_json::json!("Calendar B"))
+        );
+        assert_eq!(
+            info.get(&serde_json::json!("deleted")),
+            Some(&serde_json::json!(false))
+        );
+        assert_eq!(info.len(), 2);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn maintenance_writes_local_info_and_last_active_entry() {
+        let dir = test_dir("maintenance");
+        let mut app1 = instance(&dir);
+        let mut app2 = instance_with_app(&dir, "app2");
+
+        app1.execute_all_new_entries(&()).unwrap();
+        app2.execute_all_new_entries(&()).unwrap();
+
+        let local_info: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(app1.local_dir().join("info")).unwrap())
+                .unwrap();
+        assert_eq!(local_info["version"], serde_json::json!(2));
+        assert_eq!(local_info["last-active"].as_str().unwrap().len(), 10);
+
+        let info = get_static_info(dir.to_string_lossy().as_ref(), "rss", None).unwrap();
+        assert!(info.contains_key(&serde_json::json!("last-active-app1")));
+        assert!(info.contains_key(&serde_json::json!("last-active-app2")));
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -899,7 +1183,8 @@ mod tests {
             "rss".to_owned(),
             None,
             "app2".to_owned(),
-        );
+        )
+        .unwrap();
 
         let captured = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let captured_in_listener = captured.clone();
